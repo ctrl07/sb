@@ -13,12 +13,11 @@ jobs:
     runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
-      - shell: bash
-        run: printf '%s\n' "${{ github.event.inputs.urls }}" > suyog/urls.txt
-      - shell: bash
+      - shell: pwsh
         run: |
-          .venv/Scripts/pip install -r requirements.txt
-          .venv/Scripts/python suyog/case.py
+          "${{ github.event.inputs.urls }}" -split '\s+' | Where-Object { $_ } | Out-File -FilePath suyog\urls.txt -Encoding utf8
+      - shell: pwsh
+        run: python suyog\case.py
       - uses: actions/upload-artifact@v4
         with:
           name: captures

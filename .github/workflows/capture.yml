@@ -14,9 +14,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - shell: pwsh
-        run: |
-          "${{ github.event.inputs.urls }}" -split '\s+' | Where-Object { $_ } | Out-File -FilePath suyog\urls.txt -Encoding utf8
-      - shell: pwsh
+        env:
+          CAPTURE_URLS: ${{ github.event.inputs.urls }}
         run: python suyog\case.py
       - uses: actions/upload-artifact@v4
         with:

@@ -1,3 +1,4 @@
+import os
 import sys
 import re
 import csv
@@ -64,7 +65,11 @@ PDFS_DIR.mkdir(parents=True, exist_ok=True)
 
 cfg       = load_config(HERE / "config.yaml")
 log       = setup_logging(LOG_FILE)
-all_urls  = load_urls(URLS_FILE)
+_env_urls = os.environ.get("CAPTURE_URLS", "")
+all_urls  = (
+    [u.strip() for u in re.split(r"\s+", _env_urls) if u.strip()]
+    if _env_urls else load_urls(URLS_FILE)
+)
 done_urls = load_completed(DONE_FILE)
 pending   = [u for u in all_urls if u not in done_urls]
 

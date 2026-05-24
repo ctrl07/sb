@@ -1,0 +1,158 @@
+timing:
+  reconnect_ms: 3000
+  scroll_interval_ms: 600
+  stabilization_ms: 2500
+  inter_page_delay_min: 1.5
+  inter_page_delay_max: 4.0
+
+viewport:
+  width: 1920
+  height: 1080
+
+hide:
+  accessibility:
+  - '#accessibeButton'
+  - '#acsbWidget'
+  - '[id*=''accessibe'']'
+  - '[class*=''accessibe'']'
+  - '#userway-widget'
+  - '[class*=''userway'']'
+  - '#ae-accessibility-widget'
+  - '[class*=''audioeye'']'
+  - '#ada-button-frame'
+  - .a11y-icon-figure-and-border
+  - .a11y-icon-background
+  - '#skip-to-main-content'
+  activengage:
+  - '[id*=''activengage'']'
+  - '[class*=''activengage'']'
+  birdeye:
+  - '[id*=''birdeye'']'
+  - '[class*=''birdeye'']'
+  carnow:
+  - '[id*=''carnow'']'
+  - '[class*=''carnow'']'
+  cdk:
+  - '[class*=''cdk-modal'']'
+  - '[class*=''cdk-overlay'']'
+  - '[id*=''cdk-modal'']'
+  - '[class*=''ddc-modal'']'
+  - '[class*=''ddc-overlay'']'
+  chat:
+  - '[id*=''chat'']'
+  - '[class*=''chat'']'
+  - .di-action-bar--desktop
+  - .cn-wid-cont
+  - .cn-wid-buttons
+  - '[class^=''cn-www-widget'']'
+  - '[class*=''cn-www-widget'']'
+  - '#matador-connect-text-label-badge'
+  - '#matador-connect-text-label'
+  - '#matador-connect-text-label-new'
+  - '#matador-connect-text-label-circle'
+  - '#matador-connect-text-label-text'
+  cookies:
+  - .cookie-banner
+  - .cookie-banner-container
+  - .cookie-button
+  - '#onetrust-consent-sdk'
+  - '#onetrust-banner-sdk'
+  - '#CybotCookiebotDialog'
+  - '#CybotCookiebotDialogBodyUnderlay'
+  - '#termly-consent-preferences'
+  - '#termly-code-snippet-support'
+  - .cc-window
+  - .cc-banner
+  - '#cookie-law-info-bar'
+  - '#dealer-inspire-cookie-notice'
+  - '[class*=''dealer-inspire-cookie'']'
+  - '#ddc-cookie-consent'
+  - '[class*=''ddc-cookie'']'
+  - '#Popup_Cookie__overlay'
+  - '[class*=''cargurus-consent'']'
+  dealer_alchemist:
+  - '[id*=''dealerAlchemist'']'
+  - '[class*=''dealerAlchemist'']'
+  - '[id*=''dealer-alchemist'']'
+  - '[class*=''dealer-alchemist'']'
+  dealer_inspire:
+  - '[class*=''di-modal'']'
+  - '[class*=''di-overlay'']'
+  - '[class*=''di-lead'']'
+  - '[id*=''di-modal'']'
+  - .di-stacks--bottom
+  - .di-action-bar--desktop
+  - '#actionbar'
+  - .fixed-top-spacer
+  - '#fullMenu__overlay'
+  - '#fulldesktopmenu__overlay'
+  - '#searchOverlay__overlay'
+  - '#menu-submenu-overlay'
+  - .toolOverlay
+  - '#DIModal'
+  - '#ab-modal--vehicle-search'
+  - '#ab-modal--contactUs'
+  - '#ab-modal--mobileMenu'
+  - '#ab-modal--location'
+  - '#ab-modal--phone'
+  - '#_di-onlineshopper-loader'
+  dealer_socket:
+  - '[id*=''dealersocket'']'
+  - '[class*=''dealersocket'']'
+  elead:
+  - '[id*=''elead'']'
+  - '[class*=''elead'']'
+  gubagoo:
+  - '[id*=''gubagoo'']'
+  - '[class*=''gubagoo'']'
+  known:
+  - '[id*=''_pi_rts_modal_container'']'
+  - '[id*=''_pi_rts'']'
+  - '[class*=''pi_pop_up'']'
+  motive:
+  - '[id*=''motive-modal'']'
+  - '[class*=''motive-modal'']'
+  - '[id*=''motive-overlay'']'
+  - '[class*=''motive-overlay'']'
+  perq:
+  - '[id*=''perq'']'
+  - '[class*=''perq'']'
+  podium:
+  - '[id*=''podium-bubble'']'
+  - '[class*=''podium-bubble'']'
+  - '[id*=''podium-website-widget'']'
+  privacy:
+  - '#privacy-choices'
+  - '#privacy-policy-link'
+  - '#your-privacy-choices'
+  - '[id*=''privacy-choices'']'
+  - '[class*=''privacy-choices'']'
+  - '[id*=''privacy-widget'']'
+  - '[class*=''privacy-widget'']'
+  - '[id*=''privacyWidget'']'
+  - '[class*=''privacyWidget'']'
+  - a[href*='privacy-choices']
+  - a[href*='your-privacy-choices']
+  - '#truste-consent-track'
+  - .truste_popframe
+  - '[id*=''truste'']'
+  - '[class*=''truste'']'
+  - '#consent-bump'
+  - '[id*=''consent-bump'']'
+  - '[class*=''consent-bump'']'
+  - '#kpa-your-privacy-choices-check-x'
+  - '[id^=''kpa-'']'
+  - a[href='/privacy-requests']
+  - a[href*='privacy-requests']
+  - '#ca-consent-root'
+  recaptcha:
+  - .grecaptcha-badge
+  team_velocity:
+  - '[id*=''teamvelocity'']'
+  - '[class*=''teamvelocity'']'
+  - '[id*=''tv-modal'']'
+  - '[class*=''tv-modal'']'
+  - '[class*=''tv-popup'']'
+  vin_solutions:
+  - '[id*=''vinsolutions'']'
+  - '[class*=''vinsolutions'']'

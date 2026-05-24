@@ -1,0 +1,19 @@
+name: Capture
+
+on:
+  workflow_dispatch:  # manual trigger
+
+jobs:
+  capture:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install -r requirements.txt
+      - run: python suyog/case.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: captures
+          path: |
+            suyog/photos/
+            suyog/pdfs/
+            suyog/data.csv

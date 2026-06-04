@@ -11,7 +11,7 @@ _CHALLENGE_TITLES = {"just a moment", "attention required", "checking your brows
 _BASE_CSS = (
     "@media print { html, body { width: auto !important; height: auto !important; } }\n"
     "@media print { a::after { content: '' !important; } }\n"
-    "* { animation: none !important; transition: none !important; }\n"
+"* { animation: none !important; transition: none !important; }\n"
     "* { print-color-adjust: exact !important; -webkit-print-color-adjust: exact !important; }\n"
     "html { background: #ffffff !important; }\n"
     "body::after { content: none !important; }\n"
@@ -23,7 +23,7 @@ def load_config(path: Path) -> dict:
         "viewport": {"width": 1920, "height": 1080},
         "timing": {
             "scroll_interval_ms":   600,
-            "stabilization_ms":    2500,
+            "stabilization_ms":    4000,
             "inter_page_delay_min": 1.5,
             "inter_page_delay_max": 4.0,
         },
@@ -56,16 +56,32 @@ def _run(sb, cmd):
     return sb.cdp.loop.run_until_complete(sb.cdp.page.send(cmd))
 
 
+def _build_selectors(hide: dict) -> list[str]:
+    """Flat list of every CSS selector from the hide config."""
+    result = []
+    for selectors in hide.values():
+        if selectors:
+            result.extend(selectors)
+    return result
+
+
 class PageCapture:
     def __init__(self, sb, config: dict):
-        self.sb       = sb
-        self.viewport = config.get("viewport", {"width": 1920, "height": 1080})
-        self.timing   = config.get("timing", {})
-        self.css      = _build_css(config.get("hide", {}))
+        self.sb           = sb
+        self.viewport     = config.get("viewport", {"width": 1920, "height": 1080})
+        self.timing       = config.get("timing", {})
+        hide              = config.get("hide", {})
+        self.css          = _build_css(hide)
+        self._selectors   = _build_selectors(hide)
+        self._cdp_active  = False
 
     def open(self, url: str):
         """Navigate and solve Turnstile — retries up to 5 times."""
-        self.sb.activate_cdp_mode(url)
+        if self._cdp_active:
+            self.sb.cdp.open(url)
+        else:
+            self.sb.activate_cdp_mode(url)
+            self._cdp_active = True
         self.sb.sleep(2)
         self.sb.solve_captcha()
         self.sb.sleep(5)
@@ -84,7 +100,7 @@ class PageCapture:
         steps = max(1, int(total / (step or 1)) + 1)
         for _ in range(steps):
             self.sb.cdp.scroll_down(amount=step)
-            self.sb.sleep(0.2)
+            self.sb.sleep(0.1)
         self.sb.cdp.scroll_to_top()
         self.sb.sleep(0.3)
 
@@ -96,6 +112,21 @@ class PageCapture:
             f"(document.head||document.documentElement).appendChild(s);}})()"
         )
         self.sb.sleep(1)
+        # DOM removal — remove all configured-selector elements so they can't
+        # re-appear when full_page=True resizes the viewport for PNG capture.
+        if self._selectors:
+            import json
+            sel_json = json.dumps(self._selectors)
+            self.sb.cdp.evaluate(f"""
+            (() => {{
+                const sels = {sel_json};
+                sels.forEach(sel => {{
+                    try {{
+                        document.querySelectorAll(sel).forEach(el => el.remove());
+                    }} catch(e) {{}}
+                }});
+            }})()
+            """)
         # DOM sweep — remove remaining large fixed/absolute overlays
         self.sb.cdp.evaluate("""
         (() => {
@@ -127,25 +158,73 @@ class PageCapture:
             )
         return h
 
+    def _remove_configured_elements(self):
+        """Remove all elements matching the hide-config selectors from the DOM."""
+        if not self._selectors:
+            return
+        import json
+        sel_json = json.dumps(self._selectors)
+        self.sb.cdp.evaluate(f"""
+        (() => {{
+            const sels = {sel_json};
+            sels.forEach(sel => {{
+                try {{
+                    document.querySelectorAll(sel).forEach(el => el.remove());
+                }} catch(e) {{}}
+            }});
+        }})()
+        """)
+
     def capture_png(self, path: Path):
-        """Full-page PNG via CDP save_screenshot full_page=True."""
-        self.sb.cdp.loop.run_until_complete(
-            self.sb.cdp.page.save_screenshot(str(path), full_page=True)
-        )
+        """Full-page PNG — expands viewport manually so we can re-sweep after
+        the resize event fires (chat widgets re-inject on resize)."""
+        height = self._content_height()
+        w = self.viewport["width"]
+        # Expand to full-page height — this triggers resize listeners
+        _run(self.sb, mycdp.emulation.set_device_metrics_override(
+            width=w, height=height, device_scale_factor=1, mobile=False
+        ))
+        # Re-remove anything that re-injected itself during the resize
+        self._remove_configured_elements()
+        data = _run(self.sb, mycdp.page.capture_screenshot(
+            format_="png",
+            clip=mycdp.page.Viewport(x=0, y=0, width=w, height=height, scale=1),
+            capture_beyond_viewport=True,
+        ))
+        path.write_bytes(base64.b64decode(data))
+        # Restore original viewport
+        _run(self.sb, mycdp.emulation.set_device_metrics_override(
+            width=w, height=self.viewport["height"], device_scale_factor=1, mobile=False
+        ))
+
+    def _flatten_positions(self):
+        """Convert all fixed/sticky elements to static so they don't repeat on PDF pages.
+        Called after PNG capture so the screenshot is not affected."""
+        self.sb.cdp.evaluate("""
+        (() => {
+            document.querySelectorAll('*').forEach(el => {
+                const pos = window.getComputedStyle(el).position;
+                if (pos === 'fixed' || pos === 'sticky') {
+                    el.style.setProperty('position', 'static', 'important');
+                }
+            });
+        })()
+        """)
 
     def capture_pdf(self, path: Path):
         """Single-page PDF via CDP printToPDF."""
+        self._flatten_positions()
         height = self._content_height()
         _run(self.sb, mycdp.emulation.set_emulated_media(media="screen"))
         data, _ = _run(self.sb, mycdp.page.print_to_pdf(
             print_background=True,
             paper_width=max(1.0, self.viewport["width"] / 96.0),
-            paper_height=max(1.0, height / 96.0),
+            paper_height=max(1.0, (height + 150) / 96.0),
             margin_top=0.0,
             margin_bottom=0.0,
             margin_left=0.0,
             margin_right=0.0,
-            prefer_css_page_size=False,
+            prefer_css_page_size=True,
         ))
         path.write_bytes(base64.b64decode(data))
 

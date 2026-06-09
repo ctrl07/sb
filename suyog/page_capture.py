@@ -23,9 +23,9 @@ def load_config(path: Path) -> dict:
         "viewport": {"width": 1920, "height": 1080},
         "timing": {
             "scroll_interval_ms":   600,
-            "stabilization_ms":    4000,
-            "inter_page_delay_min": 1.5,
-            "inter_page_delay_max": 4.0,
+            "stabilization_ms":    2500,
+            "inter_page_delay_min": 1.0,
+            "inter_page_delay_max": 2.0,
         },
         "hide": {},
     }
@@ -37,7 +37,7 @@ def load_config(path: Path) -> dict:
     return defaults
 
 
-def _build_css(hide: dict) -> str:
+def _build_css(hide: dict, hide_visibility: dict | None = None) -> str:
     parts = [_BASE_CSS]
     for selectors in hide.values():
         if not selectors:
@@ -46,6 +46,15 @@ def _build_css(hide: dict) -> str:
         parts.append(
             f"{sel_str} {{\n"
             f"  display: none !important;\n"
+            f"  visibility: hidden !important;\n"
+            f"}}"
+        )
+    for selectors in (hide_visibility or {}).values():
+        if not selectors:
+            continue
+        sel_str = ",\n".join(selectors)
+        parts.append(
+            f"{sel_str} {{\n"
             f"  visibility: hidden !important;\n"
             f"}}"
         )
@@ -71,7 +80,7 @@ class PageCapture:
         self.viewport     = config.get("viewport", {"width": 1920, "height": 1080})
         self.timing       = config.get("timing", {})
         hide              = config.get("hide", {})
-        self.css          = _build_css(hide)
+        self.css          = _build_css(hide, config.get("hide_visibility", {}))
         self._selectors   = _build_selectors(hide)
         self._cdp_active  = False
 
@@ -111,7 +120,7 @@ class PageCapture:
             f"s.textContent=`{escaped}`;"
             f"(document.head||document.documentElement).appendChild(s);}})()"
         )
-        self.sb.sleep(1)
+        self.sb.sleep(0.5)
         # DOM removal — remove all configured-selector elements so they can't
         # re-appear when full_page=True resizes the viewport for PNG capture.
         if self._selectors:

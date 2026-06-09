@@ -1,6 +1,6 @@
 # Compiled Python Bytecode
 *.py[cod]
-
+actions_runner/
 # Packages
 *.egg
 *.egg-info

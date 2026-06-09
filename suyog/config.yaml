@@ -2,8 +2,8 @@ timing:
   reconnect_ms: 3000
   scroll_interval_ms: 600
   stabilization_ms: 2500
-  inter_page_delay_min: 1.5
-  inter_page_delay_max: 4.0
+  inter_page_delay_min: 1.0
+  inter_page_delay_max: 2.0
 
 viewport:
   width: 1920
@@ -40,12 +40,14 @@ hide:
   - '[class*=''ddc-overlay'']'
   chat:
   - '[id*=''chat'']'
+  - '[id*=''frmSubmitChat'']'
   - '[class*=''chat'']'
   - .di-action-bar--desktop
   - .cn-wid-cont
   - .cn-wid-buttons
   - '[class^=''cn-www-widget'']'
   - '[class*=''cn-www-widget'']'
+  - '[id*=''window-iframe'']'
   - '#matador-connect-text-label-badge'
   - '#matador-connect-text-label'
   - '#matador-connect-text-label-new'
@@ -156,3 +158,7 @@ hide:
   vin_solutions:
   - '[id*=''vinsolutions'']'
   - '[class*=''vinsolutions'']'
+
+hide_visibility:
+  chat:
+  - '[id*=''chatFormWrapper'']'

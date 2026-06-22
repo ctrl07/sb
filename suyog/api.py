@@ -1,5 +1,7 @@
 """
 FastAPI service — wraps PageCapture for bulk screenshot/PDF capture.
+Designed to be called by the Cloudflare Worker (CF handles client auth + D1 + R2 serving).
+Can also run standalone for local dev (files written to JOBS_DIR, no R2/Worker needed).
 """
 import asyncio
 import io
@@ -14,7 +16,8 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Request
+import requests as http
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, field_validator
@@ -29,15 +32,60 @@ CFG       = load_config(HERE / "config.yaml")
 LOG       = logging.getLogger("api")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-JOBS_DIR    = Path(os.getenv("JOBS_DIR", "/tmp/sb_jobs"))
-MAX_URLS    = int(os.getenv("MAX_URLS", "20"))
-API_KEY     = os.getenv("API_KEY", "")   # empty = no auth required
-URL_TIMEOUT = int(os.getenv("URL_TIMEOUT", "120"))  # seconds per URL before giving up
+JOBS_DIR       = Path(os.getenv("JOBS_DIR", "/tmp/sb_jobs"))
+MAX_URLS       = int(os.getenv("MAX_URLS", "20"))
+API_KEY        = os.getenv("API_KEY", "")
+URL_TIMEOUT    = int(os.getenv("URL_TIMEOUT", "120"))
+
+# Cloudflare integration — optional (falls back to local mode when unset)
+INTERNAL_TOKEN = os.getenv("INTERNAL_TOKEN", "")   # shared secret with CF Worker
+WORKER_URL     = os.getenv("WORKER_URL", "")        # e.g. https://screenshot-worker.workers.dev
+
+# R2 via S3-compatible API — optional (files stay local when unset)
+R2_ACCOUNT_ID  = os.getenv("R2_ACCOUNT_ID", "")
+R2_ACCESS_KEY  = os.getenv("R2_ACCESS_KEY_ID", "")
+R2_SECRET_KEY  = os.getenv("R2_SECRET_ACCESS_KEY", "")
+R2_BUCKET      = os.getenv("R2_BUCKET_NAME", "screenshot-files")
+
+PRODUCTION = bool(R2_ACCOUNT_ID and WORKER_URL and INTERNAL_TOKEN)
 
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
 _jobs: dict[str, dict] = {}
 _executor = ThreadPoolExecutor(max_workers=1)  # one browser at a time
+
+# ── R2 client (lazy) ──────────────────────────────────────────────────────────
+def _r2():
+    import boto3
+    from botocore.config import Config
+    return boto3.client(
+        "s3",
+        endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
+        aws_access_key_id=R2_ACCESS_KEY,
+        aws_secret_access_key=R2_SECRET_KEY,
+        config=Config(signature_version="s3v4"),
+        region_name="auto",
+    )
+
+
+def _upload_r2(local: Path, key: str):
+    ct = "image/png" if key.endswith(".png") else "application/pdf"
+    _r2().upload_file(str(local), R2_BUCKET, key, ExtraArgs={"ContentType": ct})
+    LOG.info("R2 ← %s", key)
+
+
+def _notify_worker(job_id: str, payload: dict):
+    if not WORKER_URL or not INTERNAL_TOKEN:
+        return
+    try:
+        http.post(
+            f"{WORKER_URL}/internal/jobs/{job_id}",
+            json=payload,
+            headers={"X-Internal-Token": INTERNAL_TOKEN},
+            timeout=10,
+        )
+    except Exception as e:
+        LOG.warning("[%s] Worker notify failed: %s", job_id[:8], e)
 
 # ── Models ────────────────────────────────────────────────────────────────────
 class CaptureRequest(BaseModel):
@@ -65,6 +113,11 @@ class CaptureRequest(BaseModel):
         if bad:
             raise ValueError(f"unknown formats: {bad}")
         return v
+
+class InternalCaptureRequest(BaseModel):
+    job_id: str
+    urls: list[str]
+    formats: list[str] = ["png", "pdf"]
 
 # ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(title="Screenshot Service", version="1.0.0")
@@ -147,12 +200,26 @@ def _run_job(job_id: str, urls: list[str], formats: list[str]):
                     if error[0]:
                         raise error[0]
 
+                    if PRODUCTION:
+                        png_url, pdf_url = None, None
+                        if png_out and png_out.exists():
+                            key = f"{job_id}/photos/{png_out.name}"
+                            _upload_r2(png_out, key)
+                            png_url = f"{WORKER_URL}/files/{key}"
+                        if pdf_out and pdf_out.exists():
+                            key = f"{job_id}/pdfs/{pdf_out.name}"
+                            _upload_r2(pdf_out, key)
+                            pdf_url = f"{WORKER_URL}/files/{key}"
+                    else:
+                        png_url = f"/files/{job_id}/photos/{png_out.name}" if png_out else None
+                        pdf_url = f"/files/{job_id}/pdfs/{pdf_out.name}"   if pdf_out else None
+
                     result.update({
                         "status":    "ok",
                         "page_name": outcome.get("page_name", ""),
                         "h1":        outcome.get("h1", ""),
-                        "png":       f"/files/{job_id}/photos/{png_out.name}" if png_out else None,
-                        "pdf":       f"/files/{job_id}/pdfs/{pdf_out.name}"   if pdf_out else None,
+                        "png":       png_url,
+                        "pdf":       pdf_url,
                     })
                     LOG.info("[%s] OK: %s", job_id[:8], url)
                 except Exception as exc:
@@ -161,6 +228,13 @@ def _run_job(job_id: str, urls: list[str], formats: list[str]):
                 finally:
                     job["results"].append(result)
                     job["done"] += 1
+                    if PRODUCTION:
+                        _notify_worker(job_id, {
+                            "status":  job["status"],
+                            "results": job["results"],
+                            "done":    job["done"],
+                            "total":   job["total"],
+                        })
 
                 time.sleep(random.uniform(
                     CFG["timing"]["inter_page_delay_min"],
@@ -172,6 +246,14 @@ def _run_job(job_id: str, urls: list[str], formats: list[str]):
         LOG.exception("[%s] Fatal: %s", job_id[:8], exc)
         job.update(status="failed", error=str(exc))
     finally:
+        if PRODUCTION:
+            _notify_worker(job_id, {
+                "status":  job.get("status", "failed"),
+                "results": job.get("results", []),
+                "done":    job.get("done", 0),
+                "total":   job.get("total", 0),
+                "error":   job.get("error"),
+            })
         if _display:
             try:
                 _display.stop()
@@ -192,6 +274,19 @@ async def capture(req: CaptureRequest):
     loop = asyncio.get_event_loop()
     loop.run_in_executor(_executor, _run_job, job_id, req.urls, req.formats)
     return {"job_id": job_id, "status": "queued", "url_count": len(req.urls)}
+
+
+@app.post("/internal/capture")
+async def internal_capture(
+    req: InternalCaptureRequest,
+    x_internal_token: str | None = Header(None),
+):
+    if not INTERNAL_TOKEN or x_internal_token != INTERNAL_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    _jobs[req.job_id] = {"status": "queued", "total": len(req.urls), "done": 0, "results": []}
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(_executor, _run_job, req.job_id, req.urls, req.formats)
+    return {"ok": True}
 
 
 @app.get("/jobs/{job_id}")
@@ -247,181 +342,207 @@ _HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Screenshot Service</title>
+<title>SnapShot — Bulk Screenshot</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <script src="https://cdn.tailwindcss.com"></script>
 <style>
-  .thumb { object-fit: cover; object-position: top; }
-  .fade  { animation: fadeIn .3s ease; }
-  @keyframes fadeIn { from { opacity:0; transform:translateY(6px); } to { opacity:1; } }
+* { font-family: 'Inter', system-ui, sans-serif; }
+.card-enter { animation: cardEnter 0.4s cubic-bezier(0.16,1,0.3,1) both; }
+@keyframes cardEnter { from { opacity:0; transform:translateY(12px) scale(0.98); } to { opacity:1; transform:none; } }
+.prog-bar { transition: width 0.5s cubic-bezier(0.4,0,0.2,1); }
+.thumb { object-fit:cover; object-position:top; }
+.btn-main { background:linear-gradient(135deg,#6366f1,#4f46e5); box-shadow:0 4px 12px rgba(99,102,241,.35); transition:all .2s; }
+.btn-main:hover:not(:disabled) { transform:translateY(-1px); box-shadow:0 6px 18px rgba(99,102,241,.45); }
+.btn-main:active:not(:disabled) { transform:none; }
+.btn-main:disabled { opacity:.55; cursor:not-allowed; box-shadow:none; }
+.fmt-pill { transition:all .15s; user-select:none; }
+.fmt-pill.on  { background:#eef2ff; color:#4338ca; border-color:#a5b4fc; }
+.fmt-pill.off { background:transparent; color:#94a3b8; border-color:transparent; }
+.pulse-dot::after { content:''; display:inline-block; width:6px; height:6px; border-radius:50%; background:currentColor; margin-left:5px; animation:pulse 1.1s ease-in-out infinite; vertical-align:middle; }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.25} }
+::-webkit-scrollbar { width:5px; }
+::-webkit-scrollbar-thumb { background:#cbd5e1; border-radius:3px; }
 </style>
 </head>
-<body class="bg-gray-50 min-h-screen">
-<div class="max-w-4xl mx-auto px-4 py-10">
+<body class="bg-slate-50 min-h-screen">
 
-  <!-- Header -->
-  <div class="mb-8">
-    <h1 class="text-3xl font-bold text-gray-900">Screenshot Service</h1>
-    <p class="text-gray-500 mt-1">Full-page PNG &amp; PDF capture — overlays, cookie banners, and chat widgets removed automatically.</p>
+<nav class="bg-white border-b border-slate-100 sticky top-0 z-10">
+  <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+    <div class="flex items-center gap-2.5">
+      <div class="w-7 h-7 rounded-lg bg-indigo-600 flex items-center justify-center shrink-0">
+        <svg class="w-3.5 h-3.5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z"/>
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M15 13a3 3 0 11-6 0 3 3 0 016 0z"/>
+        </svg>
+      </div>
+      <span class="font-semibold text-slate-900 text-sm">SnapShot</span>
+      <span class="text-xs bg-indigo-50 text-indigo-600 font-medium px-2 py-0.5 rounded-full">Bulk</span>
+    </div>
+    <span class="text-xs text-slate-400 hidden sm:block">Full-page PNG &amp; PDF · overlays removed</span>
+  </div>
+</nav>
+
+<div class="max-w-5xl mx-auto px-6 py-10">
+
+  <div class="mb-7">
+    <h1 class="text-2xl font-bold text-slate-900">Capture websites at scale</h1>
+    <p class="text-slate-500 text-sm mt-1">Paste one URL per line. Cookie banners, chat widgets &amp; overlays are stripped automatically.</p>
   </div>
 
-  <!-- Form -->
-  <div class="bg-white rounded-2xl shadow-sm border border-gray-100 p-6 mb-6">
-    <label class="block text-sm font-semibold text-gray-700 mb-2">
-      URLs <span class="font-normal text-gray-400">(one per line, max """ + str(MAX_URLS) + """)</span>
-    </label>
-    <textarea id="urls" rows="8"
-      class="w-full border border-gray-200 rounded-xl p-3 font-mono text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 resize-y"
+  <div class="bg-white rounded-2xl border border-slate-200 shadow-sm p-6 mb-4">
+    <div class="flex items-center justify-between mb-2">
+      <label for="urls" class="text-sm font-medium text-slate-700">URLs</label>
+      <span id="url-counter" class="text-xs text-slate-400 tabular-nums">0 / """ + str(MAX_URLS) + """</span>
+    </div>
+    <textarea id="urls" rows="7" oninput="countUrls()"
+      class="w-full border border-slate-200 rounded-xl px-3.5 py-3 font-mono text-sm text-slate-700 placeholder-slate-300 bg-slate-50 focus:outline-none focus:border-indigo-400 focus:bg-white transition-colors resize-none"
       placeholder="https://example.com&#10;https://another-site.com"></textarea>
 
-    <div class="flex flex-wrap items-center gap-6 mt-4">
-      <div class="flex gap-4">
-        <label class="flex items-center gap-2 text-sm cursor-pointer select-none">
-          <input type="checkbox" id="fmt-png" checked class="w-4 h-4 accent-blue-600"> PNG
-        </label>
-        <label class="flex items-center gap-2 text-sm cursor-pointer select-none">
-          <input type="checkbox" id="fmt-pdf" checked class="w-4 h-4 accent-blue-600"> PDF
-        </label>
+    <div class="flex flex-wrap items-center gap-3 mt-4">
+      <div class="flex gap-1 bg-slate-100 rounded-lg p-1">
+        <button id="fmt-png" onclick="toggleFmt('png')" class="fmt-pill on text-xs font-semibold px-3 py-1.5 rounded-md border">PNG</button>
+        <button id="fmt-pdf" onclick="toggleFmt('pdf')" class="fmt-pill on text-xs font-semibold px-3 py-1.5 rounded-md border">PDF</button>
       </div>
-""" + ("""
-      <input id="api-key" type="password" placeholder="API key"
-        class="border border-gray-200 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 w-48">
-""" if API_KEY else "") + """
-      <button id="submit-btn" onclick="submitJob()"
-        class="ml-auto bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white font-semibold px-6 py-2 rounded-xl transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
+""" + ("""      <input id="api-key" type="password" placeholder="API key"
+        class="border border-slate-200 rounded-lg px-3 py-2 text-sm text-slate-700 placeholder-slate-400 focus:outline-none focus:border-indigo-400 transition-colors w-40">
+""" if API_KEY else "") + """      <button id="submit-btn" onclick="submitJob()"
+        class="btn-main ml-auto text-white font-semibold text-sm px-7 py-2.5 rounded-xl">
         Capture
       </button>
     </div>
   </div>
 
-  <!-- Progress -->
-  <div id="progress-box" class="hidden bg-white rounded-2xl shadow-sm border border-gray-100 p-6 mb-6 fade">
-    <div class="flex justify-between items-center mb-3">
-      <span id="status-text" class="text-sm font-semibold text-gray-700">Queued…</span>
-      <span id="progress-count" class="text-sm text-gray-400">0 / 0</span>
+  <div id="progress-box" class="hidden bg-white rounded-2xl border border-slate-200 shadow-sm px-6 py-4 mb-4 card-enter">
+    <div class="flex items-center justify-between">
+      <div class="flex items-center gap-2">
+        <span id="status-dot" class="w-2 h-2 rounded-full bg-amber-400 shrink-0"></span>
+        <span id="status-text" class="text-sm font-semibold text-slate-700">Queued</span>
+      </div>
+      <span id="progress-count" class="text-xs tabular-nums text-slate-400">0 / 0</span>
     </div>
-    <div class="bg-gray-100 rounded-full h-2 overflow-hidden">
-      <div id="progress-bar" class="bg-blue-600 h-2 rounded-full transition-all duration-500" style="width:0%"></div>
+    <div class="flex items-center gap-3 mt-3">
+      <div class="flex-1 bg-slate-100 rounded-full h-1.5 overflow-hidden">
+        <div id="progress-bar" class="prog-bar bg-indigo-500 h-full rounded-full" style="width:0%"></div>
+      </div>
+      <span id="progress-pct" class="text-xs tabular-nums text-slate-400 w-8 text-right">0%</span>
     </div>
   </div>
 
-  <!-- Results -->
-  <div id="results-box" class="hidden fade">
-    <div class="flex justify-between items-center mb-4">
-      <h2 class="text-lg font-semibold text-gray-800">Results</h2>
-      <button id="zip-btn"
-        class="bg-gray-800 hover:bg-gray-900 text-white text-sm font-medium px-4 py-2 rounded-xl transition-colors">
-        Download all as ZIP
+  <div id="results-box" class="hidden">
+    <div class="flex items-center justify-between mb-4">
+      <h2 class="font-semibold text-slate-800 text-sm">Results <span id="result-count" class="font-normal text-slate-400"></span></h2>
+      <button onclick="doZip()"
+        class="flex items-center gap-1.5 text-xs font-semibold bg-slate-900 hover:bg-slate-700 text-white px-4 py-2 rounded-xl transition-colors">
+        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/>
+        </svg>
+        Download ZIP
       </button>
     </div>
-    <div id="results-grid" class="grid grid-cols-1 sm:grid-cols-2 gap-4"></div>
+    <div id="results-grid" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4"></div>
   </div>
 
 </div>
 
 <script>
-let currentJobId = null;
-let pollTimer    = null;
+const MAX = """ + str(MAX_URLS) + """;
+let jobId = null, timer = null;
+const fmts = new Set(['png','pdf']);
+
+function toggleFmt(f) {
+  if (fmts.has(f)) { if (fmts.size > 1) { fmts.delete(f); setFmt(f, false); } }
+  else { fmts.add(f); setFmt(f, true); }
+}
+function setFmt(f, on) {
+  const el = document.getElementById('fmt-'+f);
+  el.classList.toggle('on', on); el.classList.toggle('off', !on);
+}
+function countUrls() {
+  const n = getUrls().length;
+  const el = document.getElementById('url-counter');
+  el.textContent = n + ' / ' + MAX;
+  el.className = n > MAX ? 'text-xs text-red-500 tabular-nums' : 'text-xs text-slate-400 tabular-nums';
+}
+function getUrls() {
+  return document.getElementById('urls').value.split('\\n').map(u=>u.trim()).filter(Boolean);
+}
 
 async function submitJob() {
-  const urlText = document.getElementById('urls').value.trim();
-  const urls    = urlText.split('\\n').map(u => u.trim()).filter(Boolean);
-  if (!urls.length) { alert('Enter at least one URL.'); return; }
-
-  const formats = [];
-  if (document.getElementById('fmt-png').checked) formats.push('png');
-  if (document.getElementById('fmt-pdf').checked) formats.push('pdf');
-  if (!formats.length) { alert('Select at least one format.'); return; }
-
-  const apiKeyEl = document.getElementById('api-key');
-  const api_key  = apiKeyEl ? apiKeyEl.value.trim() : '';
-
+  const u = getUrls();
+  if (!u.length) { alert('Enter at least one URL.'); return; }
+  if (!fmts.size) { alert('Select at least one format.'); return; }
+  const ak = document.getElementById('api-key');
   const btn = document.getElementById('submit-btn');
-  btn.disabled    = true;
-  btn.textContent = 'Submitting…';
-
+  btn.disabled=true; btn.textContent='Submitting…';
   try {
-    const res  = await fetch('/capture', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ urls, formats, api_key }),
-    });
+    const res = await fetch('/capture', { method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ urls:u, formats:[...fmts], api_key: ak?ak.value.trim():'' }) });
     const data = await res.json();
-    if (!res.ok) { alert(data.detail || 'Request failed'); btn.disabled = false; btn.textContent = 'Capture'; return; }
-
-    currentJobId = data.job_id;
+    if (!res.ok) { alert(data.detail||'Failed'); btn.disabled=false; btn.textContent='Capture'; return; }
+    jobId = data.job_id;
     document.getElementById('progress-box').classList.remove('hidden');
     document.getElementById('results-box').classList.add('hidden');
-    document.getElementById('results-grid').innerHTML = '';
-    btn.textContent = 'Running…';
-    pollTimer = setInterval(() => poll(data.job_id), 2500);
-  } catch (e) {
-    alert('Network error: ' + e.message);
-    btn.disabled    = false;
-    btn.textContent = 'Capture';
-  }
+    document.getElementById('results-grid').innerHTML='';
+    btn.textContent='Running…';
+    timer = setInterval(()=>poll(jobId), 2500);
+  } catch(e) { alert('Network error: '+e.message); btn.disabled=false; btn.textContent='Capture'; }
 }
 
-async function poll(jobId) {
+async function poll(id) {
   try {
-    const res = await fetch('/jobs/' + jobId);
-    if (!res.ok) return;
-    const job = await res.json();
-
-    const pct = job.total ? Math.round((job.done / job.total) * 100) : 0;
-    document.getElementById('progress-bar').style.width   = pct + '%';
-    document.getElementById('progress-count').textContent = job.done + ' / ' + job.total;
-    document.getElementById('status-text').textContent    =
-      job.status === 'queued'     ? 'Queued — waiting for browser…' :
-      job.status === 'processing' ? 'Processing…' :
-      job.status === 'done'       ? '✓ Done' : '✗ Failed';
-
-    if (job.status === 'done' || job.status === 'failed') {
-      clearInterval(pollTimer);
-      const btn = document.getElementById('submit-btn');
-      btn.disabled    = false;
-      btn.textContent = 'Capture';
-      if (job.results && job.results.length) showResults(job);
+    const r = await fetch('/jobs/'+id); if(!r.ok) return;
+    const j = await r.json();
+    const pct = j.total ? Math.round(j.done/j.total*100) : 0;
+    document.getElementById('progress-bar').style.width = pct+'%';
+    document.getElementById('progress-count').textContent = j.done+' / '+j.total;
+    document.getElementById('progress-pct').textContent = pct+'%';
+    const dot=document.getElementById('status-dot'), txt=document.getElementById('status-text');
+    if (j.status==='queued')     { dot.className='w-2 h-2 rounded-full bg-amber-400 shrink-0'; txt.className='text-sm font-semibold text-slate-700'; txt.textContent='Queued'; }
+    if (j.status==='processing') { dot.className='w-2 h-2 rounded-full bg-indigo-500 shrink-0'; txt.className='text-sm font-semibold text-indigo-600 pulse-dot'; txt.textContent='Capturing'; }
+    if (j.status==='done')       { dot.className='w-2 h-2 rounded-full bg-green-500 shrink-0'; txt.className='text-sm font-semibold text-green-700'; txt.textContent='Done'; }
+    if (j.status==='failed')     { dot.className='w-2 h-2 rounded-full bg-red-500 shrink-0'; txt.className='text-sm font-semibold text-red-600'; txt.textContent='Failed'; }
+    if (j.status==='done'||j.status==='failed') {
+      clearInterval(timer);
+      const btn=document.getElementById('submit-btn'); btn.disabled=false; btn.textContent='Capture';
+      if (j.results?.length) showResults(j);
     }
-  } catch (_) {}
+  } catch(_) {}
 }
 
-function showResults(job) {
-  const box = document.getElementById('results-box');
-  box.classList.remove('hidden');
-
-  document.getElementById('zip-btn').onclick = () => {
-    window.location.href = '/download/' + currentJobId;
-  };
-
-  const grid = document.getElementById('results-grid');
-  grid.innerHTML = job.results.map(r => {
-    const isErr = r.status === 'error';
-    return `
-    <div class="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden fade">
+function showResults(j) {
+  document.getElementById('results-box').classList.remove('hidden');
+  document.getElementById('result-count').textContent='— '+j.results.length+' site'+(j.results.length!==1?'s':'');
+  document.getElementById('results-grid').innerHTML=j.results.map((r,i)=>{
+    const err=r.status==='error';
+    return `<div class="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden card-enter" style="animation-delay:${i*60}ms">
       ${r.png
-        ? `<a href="${r.png}" target="_blank" rel="noopener">
-             <img src="${r.png}" class="thumb w-full h-44 bg-gray-100" loading="lazy" alt="">
-           </a>`
-        : `<div class="w-full h-44 bg-gray-100 flex items-center justify-center text-gray-300 text-sm">No image</div>`
-      }
+        ?`<a href="${r.png}" target="_blank" class="block h-44 overflow-hidden bg-slate-100">
+            <img src="${r.png}" class="thumb w-full h-full hover:scale-105 transition-transform duration-500" loading="lazy" alt="">
+          </a>`
+        :`<div class="h-44 bg-slate-100 flex items-center justify-center">
+            <svg class="w-8 h-8 text-slate-300" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"/></svg>
+          </div>`}
       <div class="p-4">
-        <p class="text-sm font-semibold text-gray-800 truncate" title="${esc(r.page_name || r.url)}">${esc(r.page_name || r.url)}</p>
-        <p class="text-xs text-gray-400 truncate mb-3" title="${esc(r.url)}">${esc(r.url)}</p>
-        ${isErr
-          ? `<p class="text-xs text-red-500 break-all">${esc(r.error)}</p>`
-          : `<div class="flex gap-2">
-               ${r.png ? `<a href="${r.png}" download class="text-xs bg-gray-100 hover:bg-gray-200 px-3 py-1 rounded-lg font-medium transition-colors">PNG</a>` : ''}
-               ${r.pdf ? `<a href="${r.pdf}" download class="text-xs bg-gray-100 hover:bg-gray-200 px-3 py-1 rounded-lg font-medium transition-colors">PDF</a>` : ''}
+        ${err
+          ?`<div class="flex gap-2 items-start">
+              <span class="mt-0.5 shrink-0 w-4 h-4 rounded-full bg-red-100 flex items-center justify-center text-red-500 text-xs font-bold">!</span>
+              <div><p class="text-sm font-medium text-slate-700 truncate">${esc(r.url)}</p>
+                   <p class="text-xs text-red-500 mt-0.5 break-all">${esc(r.error)}</p></div>
              </div>`
-        }
+          :`<p class="text-sm font-semibold text-slate-800 truncate" title="${esc(r.page_name||r.url)}">${esc(r.page_name||r.url)}</p>
+            <p class="text-xs text-slate-400 truncate mb-3">${esc(r.url)}</p>
+            <div class="flex gap-2">
+              ${r.png?`<a href="${r.png}" download class="flex-1 text-center text-xs bg-indigo-50 hover:bg-indigo-100 text-indigo-700 font-semibold py-1.5 rounded-lg transition-colors">PNG</a>`:''}
+              ${r.pdf?`<a href="${r.pdf}" download class="flex-1 text-center text-xs bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold py-1.5 rounded-lg transition-colors">PDF</a>`:''}
+            </div>`}
       </div>
     </div>`;
   }).join('');
 }
 
-function esc(s) {
-  return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-}
+function doZip() { window.location.href='/download/'+jobId; }
+function esc(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 </script>
 </body>
 </html>

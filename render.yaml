@@ -12,5 +12,7 @@ services:
         value: "10"
       - key: JOBS_DIR
         value: /tmp/sb_jobs
+      - key: URL_TIMEOUT
+        value: "120"
       - key: API_KEY
         generateValue: false   # set manually in Render dashboard if you want auth

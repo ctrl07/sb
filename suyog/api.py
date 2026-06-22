@@ -29,9 +29,10 @@ CFG       = load_config(HERE / "config.yaml")
 LOG       = logging.getLogger("api")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-JOBS_DIR  = Path(os.getenv("JOBS_DIR", "/tmp/sb_jobs"))
-MAX_URLS  = int(os.getenv("MAX_URLS", "20"))
-API_KEY   = os.getenv("API_KEY", "")   # empty = no auth required
+JOBS_DIR    = Path(os.getenv("JOBS_DIR", "/tmp/sb_jobs"))
+MAX_URLS    = int(os.getenv("MAX_URLS", "20"))
+API_KEY     = os.getenv("API_KEY", "")   # empty = no auth required
+URL_TIMEOUT = int(os.getenv("URL_TIMEOUT", "120"))  # seconds per URL before giving up
 
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -80,8 +81,33 @@ def _slugify(url: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", base).strip("_")[:80]
 
 
+def _capture_one(page, sb, url: str, png_out, pdf_out) -> dict:
+    """Capture a single URL. Runs in a daemon thread so we can enforce a timeout."""
+    page.open(url)
+    page.scroll()
+    sb.sleep(CFG["timing"].get("stabilization_ms", 2500) / 1000)
+    page.hide_overlays()
+    if png_out:
+        page.capture_png(png_out)
+    if pdf_out:
+        page.capture_pdf(pdf_out)
+    return page.extract_data()
+
+
 def _run_job(job_id: str, urls: list[str], formats: list[str]):
+    import threading
     from seleniumbase import SB
+
+    # Start virtual display on Linux (Xvfb via sbvirtualdisplay)
+    _display = None
+    if os.name != "nt":
+        try:
+            from sbvirtualdisplay import Display
+            _display = Display(visible=False, size=(1920, 1080))
+            _display.start()
+            LOG.info("[%s] Virtual display started", job_id[:8])
+        except Exception as e:
+            LOG.warning("[%s] Virtual display failed (%s) — Chrome may crash", job_id[:8], e)
 
     job     = _jobs[job_id]
     job_dir = JOBS_DIR / job_id
@@ -100,41 +126,57 @@ def _run_job(job_id: str, urls: list[str], formats: list[str]):
                 slug    = _slugify(url)
                 png_out = png_dir / f"{slug}.png" if "png" in formats else None
                 pdf_out = pdf_dir / f"{slug}.pdf" if "pdf" in formats else None
+                result  = {"url": url}
                 try:
-                    page.open(url)
-                    page.scroll()
-                    sb.sleep(CFG["timing"].get("stabilization_ms", 2500) / 1000)
-                    page.hide_overlays()
-                    if png_out:
-                        page.capture_png(png_out)
-                    if pdf_out:
-                        page.capture_pdf(pdf_out)
-                    data = page.extract_data()
-                    job["results"].append({
-                        "url":       url,
+                    # Run capture in a daemon thread so we can time it out
+                    outcome = {}
+                    error   = [None]
+
+                    def _do():
+                        try:
+                            outcome.update(_capture_one(page, sb, url, png_out, pdf_out))
+                        except Exception as exc:
+                            error[0] = exc
+
+                    t = threading.Thread(target=_do, daemon=True)
+                    t.start()
+                    t.join(URL_TIMEOUT)
+
+                    if t.is_alive():
+                        raise TimeoutError(f"Timed out after {URL_TIMEOUT}s")
+                    if error[0]:
+                        raise error[0]
+
+                    result.update({
                         "status":    "ok",
-                        "page_name": data.get("page_name", ""),
-                        "h1":        data.get("h1", ""),
+                        "page_name": outcome.get("page_name", ""),
+                        "h1":        outcome.get("h1", ""),
                         "png":       f"/files/{job_id}/photos/{png_out.name}" if png_out else None,
                         "pdf":       f"/files/{job_id}/pdfs/{pdf_out.name}"   if pdf_out else None,
                     })
                     LOG.info("[%s] OK: %s", job_id[:8], url)
                 except Exception as exc:
                     LOG.error("[%s] FAIL: %s — %s", job_id[:8], url, exc)
-                    job["results"].append({"url": url, "status": "error", "error": str(exc)})
+                    result.update({"status": "error", "error": str(exc)})
                 finally:
+                    job["results"].append(result)
                     job["done"] += 1
 
-                delay = random.uniform(
+                time.sleep(random.uniform(
                     CFG["timing"]["inter_page_delay_min"],
                     CFG["timing"]["inter_page_delay_max"],
-                )
-                time.sleep(delay)
+                ))
 
         job["status"] = "done"
     except Exception as exc:
         LOG.exception("[%s] Fatal: %s", job_id[:8], exc)
         job.update(status="failed", error=str(exc))
+    finally:
+        if _display:
+            try:
+                _display.stop()
+            except Exception:
+                pass
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 @app.get("/health")

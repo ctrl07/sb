@@ -2,7 +2,7 @@ services:
   - type: web
     name: screenshot-service
     runtime: docker
-    dockerfilePath: ./suyog/Dockerfile
+    dockerfilePath: ./Dockerfile
     dockerContext: .
     plan: free
     envVars:

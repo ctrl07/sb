@@ -5,6 +5,7 @@ Can also run standalone for local dev (files written to JOBS_DIR, no R2/Worker n
 """
 import asyncio
 import io
+import json
 import logging
 import os
 import random
@@ -47,6 +48,10 @@ R2_ACCESS_KEY  = os.getenv("R2_ACCESS_KEY_ID", "")
 R2_SECRET_KEY  = os.getenv("R2_SECRET_ACCESS_KEY", "")
 R2_BUCKET      = os.getenv("R2_BUCKET_NAME", "screenshot-files")
 
+# Supabase — persistent job store (optional; falls back to in-memory when unset)
+SUPABASE_URL   = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY   = os.getenv("SUPABASE_KEY", "")
+
 PRODUCTION = bool(R2_ACCOUNT_ID and WORKER_URL and INTERNAL_TOKEN)
 
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
@@ -86,6 +91,46 @@ def _notify_worker(job_id: str, payload: dict):
         )
     except Exception as e:
         LOG.warning("[%s] Worker notify failed: %s", job_id[:8], e)
+
+# ── Supabase (persistent job store) ──────────────────────────────────────────
+_sb_client = None
+
+def _sb():
+    global _sb_client
+    if _sb_client is None and SUPABASE_URL and SUPABASE_KEY:
+        from supabase import create_client
+        _sb_client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    return _sb_client
+
+
+def _sb_upsert(job_id: str, job: dict):
+    sb = _sb()
+    if not sb:
+        return
+    try:
+        sb.table("jobs").upsert({
+            "id":      job_id,
+            "status":  job.get("status", "queued"),
+            "total":   job.get("total", 0),
+            "done":    job.get("done", 0),
+            "formats": ",".join(job.get("formats", ["png", "pdf"])),
+            "results": job.get("results", []),
+            "error":   job.get("error"),
+        }).execute()
+    except Exception as e:
+        LOG.warning("Supabase write failed: %s", e)
+
+
+def _sb_get_job(job_id: str) -> dict | None:
+    sb = _sb()
+    if not sb:
+        return None
+    try:
+        res = sb.table("jobs").select("*").eq("id", job_id).maybe_single().execute()
+        return res.data
+    except Exception as e:
+        LOG.warning("Supabase read failed: %s", e)
+        return None
 
 # ── Models ────────────────────────────────────────────────────────────────────
 class CaptureRequest(BaseModel):
@@ -170,6 +215,7 @@ def _run_job(job_id: str, urls: list[str], formats: list[str]):
     pdf_dir.mkdir(parents=True, exist_ok=True)
 
     job.update(status="processing", total=len(urls), done=0, results=[])
+    _sb_upsert(job_id, job)
 
     try:
         w, h = CFG["viewport"]["width"], CFG["viewport"]["height"]
@@ -228,6 +274,7 @@ def _run_job(job_id: str, urls: list[str], formats: list[str]):
                 finally:
                     job["results"].append(result)
                     job["done"] += 1
+                    _sb_upsert(job_id, job)
                     if PRODUCTION:
                         _notify_worker(job_id, {
                             "status":  job["status"],
@@ -246,6 +293,7 @@ def _run_job(job_id: str, urls: list[str], formats: list[str]):
         LOG.exception("[%s] Fatal: %s", job_id[:8], exc)
         job.update(status="failed", error=str(exc))
     finally:
+        _sb_upsert(job_id, job)
         if PRODUCTION:
             _notify_worker(job_id, {
                 "status":  job.get("status", "failed"),
@@ -270,9 +318,10 @@ async def health():
 async def capture(req: CaptureRequest):
     _auth(req.api_key)
     job_id = str(uuid.uuid4())
-    _jobs[job_id] = {"status": "queued", "total": len(req.urls), "done": 0, "results": []}
-    loop = asyncio.get_event_loop()
-    loop.run_in_executor(_executor, _run_job, job_id, req.urls, req.formats)
+    job = {"status": "queued", "total": len(req.urls), "done": 0, "results": [], "formats": req.formats}
+    _jobs[job_id] = job
+    _sb_upsert(job_id, job)
+    asyncio.get_running_loop().run_in_executor(_executor, _run_job, job_id, req.urls, req.formats)
     return {"job_id": job_id, "status": "queued", "url_count": len(req.urls)}
 
 
@@ -283,15 +332,16 @@ async def internal_capture(
 ):
     if not INTERNAL_TOKEN or x_internal_token != INTERNAL_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
-    _jobs[req.job_id] = {"status": "queued", "total": len(req.urls), "done": 0, "results": []}
-    loop = asyncio.get_event_loop()
-    loop.run_in_executor(_executor, _run_job, req.job_id, req.urls, req.formats)
+    job = {"status": "queued", "total": len(req.urls), "done": 0, "results": [], "formats": req.formats}
+    _jobs[req.job_id] = job
+    _sb_upsert(req.job_id, job)
+    asyncio.get_running_loop().run_in_executor(_executor, _run_job, req.job_id, req.urls, req.formats)
     return {"ok": True}
 
 
 @app.get("/jobs/{job_id}")
 async def job_status(job_id: str):
-    job = _jobs.get(job_id)
+    job = _jobs.get(job_id) or _sb_get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return job

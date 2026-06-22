@@ -497,8 +497,16 @@ _HTML = """<!DOCTYPE html>
 
 <script>
 const MAX = """ + str(MAX_URLS) + """;
-let jobId = null, timer = null;
+let jobId = null, timer = null, keepalive = null;
 const fmts = new Set(['png','pdf']);
+
+function startKeepalive() {
+  stopKeepalive();
+  keepalive = setInterval(() => fetch('/health').catch(()=>{}), 30000);
+}
+function stopKeepalive() {
+  if (keepalive) { clearInterval(keepalive); keepalive = null; }
+}
 
 function toggleFmt(f) {
   if (fmts.has(f)) { if (fmts.size > 1) { fmts.delete(f); setFmt(f, false); } }
@@ -536,6 +544,7 @@ async function submitJob() {
     document.getElementById('results-grid').innerHTML='';
     btn.textContent='Running…';
     timer = setInterval(()=>poll(jobId), 2500);
+    startKeepalive();
   } catch(e) { alert('Network error: '+e.message); btn.disabled=false; btn.textContent='Capture'; }
 }
 
@@ -553,7 +562,7 @@ async function poll(id) {
     if (j.status==='done')       { dot.className='w-2 h-2 rounded-full bg-green-500 shrink-0'; txt.className='text-sm font-semibold text-green-700'; txt.textContent='Done'; }
     if (j.status==='failed')     { dot.className='w-2 h-2 rounded-full bg-red-500 shrink-0'; txt.className='text-sm font-semibold text-red-600'; txt.textContent='Failed'; }
     if (j.status==='done'||j.status==='failed') {
-      clearInterval(timer);
+      clearInterval(timer); stopKeepalive();
       const btn=document.getElementById('submit-btn'); btn.disabled=false; btn.textContent='Capture';
       if (j.results?.length) showResults(j);
     }

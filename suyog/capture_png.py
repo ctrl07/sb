@@ -1,8 +1,6 @@
 import os
 import sys
 import re
-import csv
-import contextlib
 import logging
 import platform
 import random
@@ -14,17 +12,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from seleniumbase import SB
 from page_capture import PageCapture, load_config
 
-# Paths 
-HERE         = Path(__file__).resolve().parent
-URLS_FILE    = HERE / "urls.txt"
-PHOTOS_DIR   = HERE / "photos"
-PDFS_DIR     = HERE / "pdfs"
-DONE_FILE    = HERE / "done_urls.txt"
+# Paths
+HERE       = Path(__file__).resolve().parent
+URLS_FILE  = HERE / "urls.txt"
+PHOTOS_DIR = HERE / "photos"
+DONE_FILE  = HERE / "done_urls.txt"
 SKIPPED_FILE = HERE / "skipped_urls.txt"
-DATA_FILE    = HERE / "data.csv"
-LOG_FILE     = HERE / "run.log"
+LOG_FILE   = HERE / "run_png.log"
 
-# Helpers
 
 def slugify(url: str) -> str:
     base = re.sub(r"^https?://", "", url.lower())
@@ -32,7 +27,7 @@ def slugify(url: str) -> str:
 
 
 def setup_logging(log_file: Path) -> logging.Logger:
-    logger = logging.getLogger("case")
+    logger = logging.getLogger("capture_png")
     logger.handlers.clear()
     logger.setLevel(logging.INFO)
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
@@ -59,15 +54,14 @@ def load_completed(path: Path) -> set:
         return set()
     return {l.strip() for l in path.read_text(encoding="utf-8").splitlines() if l.strip()}
 
+
 # Main
-
 PHOTOS_DIR.mkdir(parents=True, exist_ok=True)
-PDFS_DIR.mkdir(parents=True, exist_ok=True)
 
-cfg       = load_config(HERE / "config.yaml")
-log       = setup_logging(LOG_FILE)
+cfg      = load_config(HERE / "config.yaml")
+log      = setup_logging(LOG_FILE)
 _env_urls = os.environ.get("CAPTURE_URLS", "")
-all_urls  = (
+all_urls = (
     [u.strip() for u in re.split(r"\s+", _env_urls) if u.strip()]
     if _env_urls else load_urls(URLS_FILE)
 )
@@ -78,7 +72,7 @@ if not pending:
     log.info("No pending URLs. Add URLs to urls.txt and re-run.")
     sys.exit(0)
 
-log.info(f"Starting batch: {len(pending)} pending / {len(all_urls)} total.")
+log.info(f"Starting PNG-only batch: {len(pending)} pending / {len(all_urls)} total.")
 
 _display = None
 if platform.system() == "Linux":
@@ -89,12 +83,11 @@ if platform.system() == "Linux":
     except ImportError:
         pass
 
+import contextlib
+
 with contextlib.ExitStack() as stack:
     skip_f = stack.enter_context(SKIPPED_FILE.open("a", encoding="utf-8"))
     done_f = stack.enter_context(DONE_FILE.open("a", encoding="utf-8"))
-    csv_f  = stack.enter_context(DATA_FILE.open("w", newline="", encoding="utf-8"))
-    writer = csv.DictWriter(csv_f, fieldnames=["url", "page_name", "h1"])
-    writer.writeheader()
 
     with SB(uc=True, test=True, window_size=f"{cfg['viewport']['width']},{cfg['viewport']['height']}") as sb:
         page = PageCapture(sb, cfg)
@@ -103,13 +96,11 @@ with contextlib.ExitStack() as stack:
             slug = slugify(url)
             log.info(f"({i}/{len(pending)}): {url}")
             try:
-                data = page.run(
-                    url,
-                    png_path=PHOTOS_DIR / f"{slug}.png",
-                    pdf_path=PDFS_DIR   / f"{slug}.pdf",
-                )
-                writer.writerow({"url": url, **data})
-                csv_f.flush()
+                page.open(url)
+                page.scroll()
+                sb.sleep(cfg["timing"].get("stabilization_ms", 2500) / 1000)
+                page.hide_overlays()
+                page.capture_png(PHOTOS_DIR / f"{slug}.png")
                 done_f.write(f"{url}\n")
                 done_f.flush()
                 log.info("  Done")

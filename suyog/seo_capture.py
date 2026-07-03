@@ -207,7 +207,6 @@ with contextlib.ExitStack() as stack:
             log.info(f"({i}/{len(pending)}): {url}")
             try:
                 page.open(url)
-                page.scroll()
                 sb.sleep(cfg["timing"].get("stabilization_ms", 2500) / 1000)
 
                 seo = extract_seo(sb)

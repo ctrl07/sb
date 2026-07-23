@@ -16,13 +16,13 @@ from page_capture import PageCapture, load_config
 
 # Paths 
 HERE         = Path(__file__).resolve().parent
+OUT_DIR      = HERE / "out"
 URLS_FILE    = HERE / "urls.txt"
-PHOTOS_DIR   = HERE / "photos"
-PDFS_DIR     = HERE / "pdfs"
-DONE_FILE    = HERE / "done_urls.txt"
-SKIPPED_FILE = HERE / "skipped_urls.txt"
-DATA_FILE    = HERE / "data.csv"
-LOG_FILE     = HERE / "run.log"
+PHOTOS_DIR   = OUT_DIR / "photos"
+DONE_FILE    = OUT_DIR / "done_urls.txt"
+SKIPPED_FILE = OUT_DIR / "skipped_urls.txt"
+DATA_FILE    = OUT_DIR / "data.csv"
+LOG_FILE     = OUT_DIR / "run.log"
 
 # Helpers
 
@@ -61,16 +61,19 @@ def load_completed(path: Path) -> set:
 
 # Main
 
+OUT_DIR.mkdir(parents=True, exist_ok=True)
 PHOTOS_DIR.mkdir(parents=True, exist_ok=True)
-PDFS_DIR.mkdir(parents=True, exist_ok=True)
 
 cfg       = load_config(HERE / "config.yaml")
 log       = setup_logging(LOG_FILE)
-_env_urls = os.environ.get("CAPTURE_URLS", "")
-all_urls  = (
-    [u.strip() for u in re.split(r"\s+", _env_urls) if u.strip()]
-    if _env_urls else load_urls(URLS_FILE)
-)
+_url_file = os.environ.get("URL_FILE") or os.environ.get("CAPTURE_URLS", "")
+if _url_file and Path(_url_file).exists():
+    all_urls = load_urls(Path(_url_file))
+else:
+    all_urls = (
+        [u.strip() for u in re.split(r"\s+", _url_file) if u.strip()]
+        if _url_file else load_urls(URLS_FILE)
+    )
 done_urls = load_completed(DONE_FILE)
 pending   = [u for u in all_urls if u not in done_urls]
 
@@ -103,11 +106,12 @@ with contextlib.ExitStack() as stack:
             slug = slugify(url)
             log.info(f"({i}/{len(pending)}): {url}")
             try:
-                data = page.run(
-                    url,
-                    png_path=PHOTOS_DIR / f"{slug}.png",
-                    pdf_path=PDFS_DIR   / f"{slug}.pdf",
-                )
+                page.open(url)
+                page.scroll()
+                sb.sleep(cfg["timing"].get("stabilization_ms", 2500) / 1000)
+                page.hide_overlays()
+                page.capture_png(PHOTOS_DIR / f"{slug}.png")
+                data = page.extract_data()
                 writer.writerow({"url": url, **data})
                 csv_f.flush()
                 done_f.write(f"{url}\n")

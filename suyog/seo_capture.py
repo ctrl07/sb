@@ -28,11 +28,12 @@ from page_capture import PageCapture, load_config
 # Paths
 # ---------------------------------------------------------------------------
 HERE         = Path(__file__).resolve().parent
+OUT_DIR      = HERE / "out"
 URLS_FILE    = HERE / "urls.txt"
-DONE_FILE    = HERE / "seo_done_urls.txt"
-SKIPPED_FILE = HERE / "seo_skipped_urls.txt"
-DATA_FILE    = HERE / "seo_data.csv"
-LOG_FILE     = HERE / "seo_run.log"
+DONE_FILE    = OUT_DIR / "seo_done_urls.txt"
+SKIPPED_FILE = OUT_DIR / "seo_skipped_urls.txt"
+DATA_FILE    = OUT_DIR / "seo_data.csv"
+LOG_FILE     = OUT_DIR / "seo_run.log"
 
 FIELDS = [
     "url", "title", "title_len", "meta_description", "meta_desc_len",
@@ -168,13 +169,18 @@ def extract_seo(sb) -> dict:
 # Main
 # ---------------------------------------------------------------------------
 
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
 cfg      = load_config(HERE / "config.yaml")
 log      = setup_logging(LOG_FILE)
-_env_urls = os.environ.get("CAPTURE_URLS", "")
-all_urls = (
-    [u.strip() for u in re.split(r"\s+", _env_urls) if u.strip()]
-    if _env_urls else load_urls(URLS_FILE)
-)
+_url_file = os.environ.get("URL_FILE") or os.environ.get("CAPTURE_URLS", "")
+if _url_file and Path(_url_file).exists():
+    all_urls = load_urls(Path(_url_file))
+else:
+    all_urls = (
+        [u.strip() for u in re.split(r"\s+", _url_file) if u.strip()]
+        if _url_file else load_urls(URLS_FILE)
+    )
 done_urls = load_completed(DONE_FILE)
 pending   = [u for u in all_urls if u not in done_urls]
 

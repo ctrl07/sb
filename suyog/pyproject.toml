@@ -1,0 +1,33 @@
+[project]
+name = "suyog"
+version = "0.1.0"
+description = "Batch screenshot/PDF/SEO capture with SeleniumBase"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "seleniumbase>=4.0.0",
+    "pyyaml>=6.0.1",
+    "pyvirtualdisplay>=2.0",
+    "img2pdf>=0.4.0",
+    "pillow>=10.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.5.0",
+    "pytest>=8.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.5.0",
+    "pytest>=8.0.0",
+]
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["case*", "capture_png*", "seo_capture*", "page_capture*", "chrome_proxy*"]

@@ -14,11 +14,12 @@ from page_capture import PageCapture, load_config
 
 # Paths
 HERE       = Path(__file__).resolve().parent
+OUT_DIR    = HERE / "out"
 URLS_FILE  = HERE / "urls.txt"
-PHOTOS_DIR = HERE / "photos"
-DONE_FILE  = HERE / "done_urls.txt"
-SKIPPED_FILE = HERE / "skipped_urls.txt"
-LOG_FILE   = HERE / "run_png.log"
+PHOTOS_DIR = OUT_DIR / "photos"
+DONE_FILE  = OUT_DIR / "done_urls.txt"
+SKIPPED_FILE = OUT_DIR / "skipped_urls.txt"
+LOG_FILE   = OUT_DIR / "run_png.log"
 
 
 def slugify(url: str) -> str:
@@ -56,15 +57,19 @@ def load_completed(path: Path) -> set:
 
 
 # Main
+OUT_DIR.mkdir(parents=True, exist_ok=True)
 PHOTOS_DIR.mkdir(parents=True, exist_ok=True)
 
 cfg      = load_config(HERE / "config.yaml")
 log      = setup_logging(LOG_FILE)
-_env_urls = os.environ.get("CAPTURE_URLS", "")
-all_urls = (
-    [u.strip() for u in re.split(r"\s+", _env_urls) if u.strip()]
-    if _env_urls else load_urls(URLS_FILE)
-)
+_url_file = os.environ.get("URL_FILE") or os.environ.get("CAPTURE_URLS", "")
+if _url_file and Path(_url_file).exists():
+    all_urls = load_urls(Path(_url_file))
+else:
+    all_urls = (
+        [u.strip() for u in re.split(r"\s+", _url_file) if u.strip()]
+        if _url_file else load_urls(URLS_FILE)
+    )
 done_urls = load_completed(DONE_FILE)
 pending   = [u for u in all_urls if u not in done_urls]
 
